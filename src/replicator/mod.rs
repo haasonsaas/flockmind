@@ -1,6 +1,6 @@
 mod network;
 mod raft_node;
-mod state_machine;
+pub mod state_machine;
 pub mod storage;
 
 pub use network::*;

@@ -1,5 +1,5 @@
 mod runner;
-mod validator;
+pub mod validator;
 
 pub use runner::*;
 pub use validator::*;
