@@ -1,0 +1,44 @@
+# FlockMind Configuration Example
+# Copy this to flockmind.toml and edit
+
+# Node identity (optional, auto-generated if not set)
+# node_id = "node-1"
+# hostname = "my-host"
+
+# Tags for this node (used by brain for placement decisions)
+tags = ["dev", "gpu"]
+
+# Network binding
+bind_addr = "0.0.0.0"
+bind_port = 9000
+
+# Data directory for Raft state
+data_dir = "/var/lib/flockmind"
+
+# Heartbeat and planning intervals
+heartbeat_interval_secs = 10
+planning_interval_secs = 30
+
+# Cluster peers (empty for single-node, add peers for multi-node)
+# [[peers]]
+# node_id = "node-2"
+# addr = "192.168.1.102:9000"
+# is_voter = true
+
+# LLM Brain Configuration
+[llm]
+enabled = false
+# api_base = "https://api.openai.com/v1"  # Optional, for custom endpoints
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4o-mini"
+max_tokens = 2048
+temperature = 0.1
+
+# Execution Policy - controls what actions are allowed
+[policy]
+allow_restart_services = false
+allow_docker = false
+allowed_sync_paths = ["/home", "/data"]
+blocked_sync_paths = ["/etc", "/var", "/usr", "/bin", "/sbin", "/root"]
+require_approval_for_destructive = true
+max_concurrent_tasks_per_node = 5
