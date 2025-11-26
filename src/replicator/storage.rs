@@ -7,10 +7,10 @@ use openraft::{
     SnapshotMeta, StorageError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
+use std::path::Path;
 use std::sync::Mutex;
 
 pub type NodeIdType = u64;
@@ -34,27 +34,116 @@ impl std::fmt::Display for HiveNode {
     }
 }
 
-pub struct HiveStorage {
-    vote: Mutex<Option<Vote<NodeIdType>>>,
-    log: Mutex<BTreeMap<u64, Entry<TypeConfig>>>,
-    last_purged: Mutex<Option<LogId<NodeIdType>>>,
+const KEY_VOTE: &[u8] = b"vote";
+const KEY_LAST_PURGED: &[u8] = b"last_purged";
+const KEY_LAST_APPLIED: &[u8] = b"last_applied";
+const KEY_MEMBERSHIP: &[u8] = b"membership";
+const KEY_SNAPSHOT_IDX: &[u8] = b"snapshot_idx";
+const KEY_STATE_SNAPSHOT: &[u8] = b"state_snapshot";
+
+pub struct SledStorage {
+    db: sled::Db,
+    log_tree: sled::Tree,
+    meta_tree: sled::Tree,
     state: SharedState,
     snapshot_idx: Mutex<u64>,
-    last_applied: Mutex<Option<LogId<NodeIdType>>>,
-    last_membership: Mutex<StoredMembership<NodeIdType, HiveNode>>,
 }
 
-impl HiveStorage {
-    pub fn new(state: SharedState) -> Self {
-        Self {
-            vote: Mutex::new(None),
-            log: Mutex::new(BTreeMap::new()),
-            last_purged: Mutex::new(None),
-            state,
-            snapshot_idx: Mutex::new(0),
-            last_applied: Mutex::new(None),
-            last_membership: Mutex::new(StoredMembership::default()),
+impl SledStorage {
+    pub fn new<P: AsRef<Path>>(path: P, state: SharedState) -> Result<Self> {
+        let db = sled::open(path)?;
+        let log_tree = db.open_tree("raft_log")?;
+        let meta_tree = db.open_tree("raft_meta")?;
+
+        let snapshot_idx = meta_tree
+            .get(KEY_SNAPSHOT_IDX)?
+            .map(|v| bincode::deserialize(&v).unwrap_or(0))
+            .unwrap_or(0);
+
+        if let Some(state_data) = meta_tree.get(KEY_STATE_SNAPSHOT)? {
+            if let Ok(hive_state) = serde_json::from_slice::<HiveState>(&state_data) {
+                state.restore(hive_state);
+                tracing::info!("Restored state from snapshot");
+            }
         }
+
+        Ok(Self {
+            db,
+            log_tree,
+            meta_tree,
+            state,
+            snapshot_idx: Mutex::new(snapshot_idx),
+        })
+    }
+
+    fn log_key(index: u64) -> [u8; 8] {
+        index.to_be_bytes()
+    }
+
+    fn get_vote(&self) -> Option<Vote<NodeIdType>> {
+        self.meta_tree
+            .get(KEY_VOTE)
+            .ok()
+            .flatten()
+            .and_then(|v| bincode::deserialize(&v).ok())
+    }
+
+    fn set_vote(&self, vote: &Vote<NodeIdType>) -> Result<(), sled::Error> {
+        let data = bincode::serialize(vote).unwrap();
+        self.meta_tree.insert(KEY_VOTE, data)?;
+        self.meta_tree.flush()?;
+        Ok(())
+    }
+
+    fn get_last_purged(&self) -> Option<LogId<NodeIdType>> {
+        self.meta_tree
+            .get(KEY_LAST_PURGED)
+            .ok()
+            .flatten()
+            .and_then(|v| bincode::deserialize(&v).ok())
+    }
+
+    fn set_last_purged(&self, log_id: &LogId<NodeIdType>) -> Result<(), sled::Error> {
+        let data = bincode::serialize(log_id).unwrap();
+        self.meta_tree.insert(KEY_LAST_PURGED, data)?;
+        Ok(())
+    }
+
+    fn get_last_applied(&self) -> Option<LogId<NodeIdType>> {
+        self.meta_tree
+            .get(KEY_LAST_APPLIED)
+            .ok()
+            .flatten()
+            .and_then(|v| bincode::deserialize(&v).ok())
+    }
+
+    fn set_last_applied(&self, log_id: &LogId<NodeIdType>) -> Result<(), sled::Error> {
+        let data = bincode::serialize(log_id).unwrap();
+        self.meta_tree.insert(KEY_LAST_APPLIED, data)?;
+        Ok(())
+    }
+
+    fn get_membership(&self) -> StoredMembership<NodeIdType, HiveNode> {
+        self.meta_tree
+            .get(KEY_MEMBERSHIP)
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_slice(&v).ok())
+            .unwrap_or_default()
+    }
+
+    fn set_membership(&self, membership: &StoredMembership<NodeIdType, HiveNode>) -> Result<(), sled::Error> {
+        let data = serde_json::to_vec(membership).unwrap();
+        self.meta_tree.insert(KEY_MEMBERSHIP, data)?;
+        Ok(())
+    }
+
+    fn save_state_snapshot(&self) -> Result<(), sled::Error> {
+        let hive_state = self.state.snapshot();
+        let data = serde_json::to_vec(&hive_state).unwrap();
+        self.meta_tree.insert(KEY_STATE_SNAPSHOT, data)?;
+        self.meta_tree.flush()?;
+        Ok(())
     }
 
     pub fn shared_state(&self) -> &SharedState {
@@ -62,28 +151,69 @@ impl HiveStorage {
     }
 }
 
-impl RaftLogReader<TypeConfig> for HiveStorage {
+impl RaftLogReader<TypeConfig> for SledStorage {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeIdType>> {
-        let log = self.log.lock().unwrap();
-        let entries: Vec<_> = log.range(range).map(|(_, v)| v.clone()).collect();
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(&s) => s,
+            std::ops::Bound::Excluded(&s) => s + 1,
+            std::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(&e) => Some(e + 1),
+            std::ops::Bound::Excluded(&e) => Some(e),
+            std::ops::Bound::Unbounded => None,
+        };
+
+        let mut entries = Vec::new();
+        for item in self.log_tree.range(Self::log_key(start)..) {
+            let (key, value) = item.map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Read,
+                    std::io::Error::new(std::io::ErrorKind::Other, e),
+                )
+            })?;
+
+            let index = u64::from_be_bytes(key.as_ref().try_into().unwrap());
+            if let Some(e) = end {
+                if index >= e {
+                    break;
+                }
+            }
+
+            let entry: Entry<TypeConfig> = serde_json::from_slice(&value).map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Read,
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+                )
+            })?;
+            entries.push(entry);
+        }
+
         Ok(entries)
     }
 }
 
-impl RaftSnapshotBuilder<TypeConfig> for HiveStorage {
+impl RaftSnapshotBuilder<TypeConfig> for SledStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeIdType>> {
         let hive_state = self.state.snapshot();
         let data = serde_json::to_vec(&hive_state).unwrap();
 
-        let last_applied = self.last_applied.lock().unwrap().clone();
-        let last_membership = self.last_membership.lock().unwrap().clone();
+        let last_applied = self.get_last_applied();
+        let last_membership = self.get_membership();
 
         let mut idx = self.snapshot_idx.lock().unwrap();
         *idx += 1;
         let snapshot_idx = *idx;
+
+        let _ = self.meta_tree.insert(
+            KEY_SNAPSHOT_IDX,
+            bincode::serialize(&snapshot_idx).unwrap(),
+        );
 
         let snapshot_id = format!(
             "{}-{}-{}",
@@ -107,14 +237,26 @@ impl RaftSnapshotBuilder<TypeConfig> for HiveStorage {
     }
 }
 
-impl RaftStorage<TypeConfig> for HiveStorage {
+impl RaftStorage<TypeConfig> for SledStorage {
     type LogReader = Self;
     type SnapshotBuilder = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeIdType>> {
-        let log = self.log.lock().unwrap();
-        let last_purged = *self.last_purged.lock().unwrap();
-        let last_log_id = log.iter().next_back().map(|(_, e)| e.log_id);
+        let last_purged = self.get_last_purged();
+
+        let last_log_id = self
+            .log_tree
+            .last()
+            .map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Read,
+                    std::io::Error::new(std::io::ErrorKind::Other, e),
+                )
+            })?
+            .and_then(|(_, v)| serde_json::from_slice::<Entry<TypeConfig>>(&v).ok())
+            .map(|e| e.log_id);
+
         Ok(LogState {
             last_purged_log_id: last_purged,
             last_log_id,
@@ -122,23 +264,26 @@ impl RaftStorage<TypeConfig> for HiveStorage {
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeIdType>) -> Result<(), StorageError<NodeIdType>> {
-        *self.vote.lock().unwrap() = Some(vote.clone());
-        Ok(())
+        self.set_vote(vote).map_err(|e| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::Vote,
+                openraft::ErrorVerb::Write,
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+            )
+        })
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeIdType>>, StorageError<NodeIdType>> {
-        Ok(self.vote.lock().unwrap().clone())
+        Ok(self.get_vote())
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
-        HiveStorage {
-            vote: Mutex::new(self.vote.lock().unwrap().clone()),
-            log: Mutex::new(self.log.lock().unwrap().clone()),
-            last_purged: Mutex::new(*self.last_purged.lock().unwrap()),
+        SledStorage {
+            db: self.db.clone(),
+            log_tree: self.log_tree.clone(),
+            meta_tree: self.meta_tree.clone(),
             state: self.state.clone(),
             snapshot_idx: Mutex::new(*self.snapshot_idx.lock().unwrap()),
-            last_applied: Mutex::new(*self.last_applied.lock().unwrap()),
-            last_membership: Mutex::new(self.last_membership.lock().unwrap().clone()),
         }
     }
 
@@ -146,10 +291,24 @@ impl RaftStorage<TypeConfig> for HiveStorage {
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
     {
-        let mut log = self.log.lock().unwrap();
         for entry in entries {
-            log.insert(entry.log_id.index, entry);
+            let key = Self::log_key(entry.log_id.index);
+            let value = serde_json::to_vec(&entry).unwrap();
+            self.log_tree.insert(key, value).map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Write,
+                    std::io::Error::new(std::io::ErrorKind::Other, e),
+                )
+            })?;
         }
+        self.log_tree.flush().map_err(|e| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::Logs,
+                openraft::ErrorVerb::Write,
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+            )
+        })?;
         Ok(())
     }
 
@@ -157,25 +316,50 @@ impl RaftStorage<TypeConfig> for HiveStorage {
         &mut self,
         log_id: LogId<NodeIdType>,
     ) -> Result<(), StorageError<NodeIdType>> {
-        let mut log = self.log.lock().unwrap();
-        let to_remove: Vec<_> = log.range(log_id.index..).map(|(k, _)| *k).collect();
-        for key in to_remove {
-            log.remove(&key);
+        let keys_to_remove: Vec<_> = self
+            .log_tree
+            .range(Self::log_key(log_id.index)..)
+            .filter_map(|r| r.ok().map(|(k, _)| k))
+            .collect();
+
+        for key in keys_to_remove {
+            self.log_tree.remove(key).map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Write,
+                    std::io::Error::new(std::io::ErrorKind::Other, e),
+                )
+            })?;
         }
         Ok(())
     }
 
-    async fn purge_logs_upto(&mut self, log_id: LogId<NodeIdType>) -> Result<(), StorageError<NodeIdType>> {
-        {
-            let mut last_purged = self.last_purged.lock().unwrap();
-            *last_purged = Some(log_id);
-        }
-        {
-            let mut log = self.log.lock().unwrap();
-            let to_remove: Vec<_> = log.range(..=log_id.index).map(|(k, _)| *k).collect();
-            for key in to_remove {
-                log.remove(&key);
-            }
+    async fn purge_logs_upto(
+        &mut self,
+        log_id: LogId<NodeIdType>,
+    ) -> Result<(), StorageError<NodeIdType>> {
+        self.set_last_purged(&log_id).map_err(|e| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::Logs,
+                openraft::ErrorVerb::Write,
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+            )
+        })?;
+
+        let keys_to_remove: Vec<_> = self
+            .log_tree
+            .range(..=Self::log_key(log_id.index))
+            .filter_map(|r| r.ok().map(|(k, _)| k))
+            .collect();
+
+        for key in keys_to_remove {
+            self.log_tree.remove(key).map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Write,
+                    std::io::Error::new(std::io::ErrorKind::Other, e),
+                )
+            })?;
         }
         Ok(())
     }
@@ -189,9 +373,7 @@ impl RaftStorage<TypeConfig> for HiveStorage {
         ),
         StorageError<NodeIdType>,
     > {
-        let last_applied = self.last_applied.lock().unwrap().clone();
-        let membership = self.last_membership.lock().unwrap().clone();
-        Ok((last_applied, membership))
+        Ok((self.get_last_applied(), self.get_membership()))
     }
 
     async fn apply_to_state_machine(
@@ -201,7 +383,13 @@ impl RaftStorage<TypeConfig> for HiveStorage {
         let mut results = Vec::new();
 
         for entry in entries {
-            *self.last_applied.lock().unwrap() = Some(entry.log_id);
+            self.set_last_applied(&entry.log_id).map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::StateMachine,
+                    openraft::ErrorVerb::Write,
+                    std::io::Error::new(std::io::ErrorKind::Other, e),
+                )
+            })?;
 
             match &entry.payload {
                 EntryPayload::Blank => {}
@@ -209,25 +397,37 @@ impl RaftStorage<TypeConfig> for HiveStorage {
                     self.state.apply(cmd);
                 }
                 EntryPayload::Membership(mem) => {
-                    *self.last_membership.lock().unwrap() =
-                        StoredMembership::new(Some(entry.log_id), mem.clone());
+                    let membership = StoredMembership::new(Some(entry.log_id), mem.clone());
+                    self.set_membership(&membership).map_err(|e| {
+                        StorageError::from_io_error(
+                            openraft::ErrorSubject::StateMachine,
+                            openraft::ErrorVerb::Write,
+                            std::io::Error::new(std::io::ErrorKind::Other, e),
+                        )
+                    })?;
                 }
             }
             results.push(());
         }
 
+        self.save_state_snapshot().map_err(|e| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::StateMachine,
+                openraft::ErrorVerb::Write,
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+            )
+        })?;
+
         Ok(results)
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        HiveStorage {
-            vote: Mutex::new(self.vote.lock().unwrap().clone()),
-            log: Mutex::new(self.log.lock().unwrap().clone()),
-            last_purged: Mutex::new(*self.last_purged.lock().unwrap()),
+        SledStorage {
+            db: self.db.clone(),
+            log_tree: self.log_tree.clone(),
+            meta_tree: self.meta_tree.clone(),
             state: self.state.clone(),
             snapshot_idx: Mutex::new(*self.snapshot_idx.lock().unwrap()),
-            last_applied: Mutex::new(*self.last_applied.lock().unwrap()),
-            last_membership: Mutex::new(self.last_membership.lock().unwrap().clone()),
         }
     }
 
@@ -252,8 +452,32 @@ impl RaftStorage<TypeConfig> for HiveStorage {
         })?;
 
         self.state.restore(hive_state);
-        *self.last_applied.lock().unwrap() = meta.last_log_id;
-        *self.last_membership.lock().unwrap() = meta.last_membership.clone();
+
+        if let Some(log_id) = meta.last_log_id {
+            self.set_last_applied(&log_id).map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::StateMachine,
+                    openraft::ErrorVerb::Write,
+                    std::io::Error::new(std::io::ErrorKind::Other, e),
+                )
+            })?;
+        }
+
+        self.set_membership(&meta.last_membership).map_err(|e| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::StateMachine,
+                openraft::ErrorVerb::Write,
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+            )
+        })?;
+
+        self.save_state_snapshot().map_err(|e| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::StateMachine,
+                openraft::ErrorVerb::Write,
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+            )
+        })?;
 
         Ok(())
     }
@@ -265,10 +489,13 @@ impl RaftStorage<TypeConfig> for HiveStorage {
     }
 }
 
-pub type HiveAdaptorLogStore = Adaptor<TypeConfig, HiveStorage>;
-pub type HiveAdaptorStateMachine = Adaptor<TypeConfig, HiveStorage>;
+pub type SledAdaptorLogStore = Adaptor<TypeConfig, SledStorage>;
+pub type SledAdaptorStateMachine = Adaptor<TypeConfig, SledStorage>;
 
-pub fn create_storage(state: SharedState) -> (HiveAdaptorLogStore, HiveAdaptorStateMachine) {
-    let storage = HiveStorage::new(state);
-    Adaptor::new(storage)
+pub fn create_storage<P: AsRef<Path>>(
+    path: P,
+    state: SharedState,
+) -> Result<(SledAdaptorLogStore, SledAdaptorStateMachine)> {
+    let storage = SledStorage::new(path, state)?;
+    Ok(Adaptor::new(storage))
 }

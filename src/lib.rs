@@ -1,17 +1,21 @@
 pub mod api;
 pub mod attachments;
+pub mod auth;
 pub mod brain;
 pub mod config;
 pub mod daemon;
 pub mod executor;
+pub mod raft_api;
 pub mod replicator;
 pub mod types;
 
 pub use api::create_router;
 pub use attachments::AttachmentRegistry;
+pub use auth::{CaCertificate, EnrollmentManager, NodeCertificate};
 pub use brain::{Brain, LlmPlanner, NoOpBrain};
 pub use config::NodeConfig;
 pub use daemon::HiveDaemon;
 pub use executor::{Executor, ExecutionPolicy, HiveExecutor};
+pub use raft_api::create_raft_router;
 pub use replicator::{RaftReplicator, Replicator};
 pub use types::*;

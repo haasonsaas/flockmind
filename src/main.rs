@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use flockmind::{create_router, HiveDaemon, NodeConfig};
+use flockmind::{create_raft_router, create_router, HiveDaemon, NodeConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -62,7 +62,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
 
     let daemon = Arc::new(HiveDaemon::new(config.clone()).await?);
 
-    let router = create_router(daemon.clone());
+    let api_router = create_router(daemon.clone());
+    let raft_router = create_raft_router(daemon.replicator().clone());
+    let router = api_router.merge(raft_router);
+    
     let listener = TcpListener::bind(&config.listen_addr()).await?;
     info!("API server listening on {}", config.listen_addr());
 

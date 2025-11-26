@@ -1,5 +1,5 @@
 use crate::attachments::AttachmentRegistry;
-use crate::brain::{Brain, LlmPlanner, NoOpBrain};
+use crate::brain::{ActionTracker, Brain, LlmPlanner, NoOpBrain};
 use crate::config::NodeConfig;
 use crate::executor::{Executor, HiveExecutor};
 use crate::replicator::{RaftReplicator, Replicator};
@@ -18,6 +18,7 @@ pub struct HiveDaemon {
     brain: Arc<dyn Brain>,
     executor: Arc<HiveExecutor<RaftReplicator>>,
     attachments: AttachmentRegistry,
+    tracker: Arc<ActionTracker>,
     config: NodeConfig,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
@@ -39,11 +40,14 @@ impl HiveDaemon {
             u64::from_le_bytes(arr)
         };
 
+        std::fs::create_dir_all(&config.data_dir)?;
+        
         let replicator = Arc::new(
             RaftReplicator::new(
                 raft_node_id,
                 config.listen_addr(),
                 hostname.clone(),
+                &config.data_dir,
             )
             .await?,
         );
@@ -68,6 +72,7 @@ impl HiveDaemon {
         ));
 
         let attachments = AttachmentRegistry::new(node_id.clone());
+        let tracker = Arc::new(ActionTracker::new());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -79,6 +84,7 @@ impl HiveDaemon {
             brain,
             executor,
             attachments,
+            tracker,
             config,
             shutdown_tx,
             shutdown_rx,
@@ -221,6 +227,7 @@ impl HiveDaemon {
         let brain = self.brain.clone();
         let executor = self.executor.clone();
         let attachments = self.attachments.clone();
+        let tracker = self.tracker.clone();
         let interval = self.config.planning_interval_secs;
         let mut shutdown_rx = self.shutdown_rx.clone();
 
@@ -231,6 +238,8 @@ impl HiveDaemon {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
+                        tracker.cleanup_stale();
+
                         if !replicator.is_leader() {
                             debug!("Not leader, skipping planning");
                             continue;
@@ -244,12 +253,51 @@ impl HiveDaemon {
                             continue;
                         }
 
+                        let recent_failures = tracker.get_recent_failures(10);
+                        let stats = tracker.get_stats();
+                        debug!(
+                            "Tracker stats: pending={}, executing={}, completed={}, failed={}",
+                            stats.pending, stats.executing, stats.completed, stats.failed
+                        );
+
                         match brain.plan(&view.goals, &view, &attachment_list).await {
                             Ok(actions) => {
                                 for action in actions {
-                                    debug!("Executing brain action: {:?}", action);
-                                    if let Err(e) = executor.execute(action).await {
-                                        warn!("Failed to execute action: {}", e);
+                                    if tracker.has_similar_pending(&action) {
+                                        debug!("Skipping duplicate action: {:?}", action);
+                                        continue;
+                                    }
+
+                                    if is_recently_failed(&action, &recent_failures) {
+                                        debug!("Skipping recently failed action: {:?}", action);
+                                        continue;
+                                    }
+
+                                    let action_id = tracker.track_action(action.clone());
+                                    tracker.mark_executing(&action_id);
+
+                                    debug!("Executing brain action {}: {:?}", action_id, action);
+                                    
+                                    let goal_id = extract_goal_id(&action);
+                                    
+                                    match executor.execute(action).await {
+                                        Ok(()) => {
+                                            tracker.mark_completed(&action_id, None);
+                                            if let Some(gid) = goal_id {
+                                                tracker.update_goal_progress(&gid, true, None);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let msg = e.to_string();
+                                            warn!("Failed to execute action {}: {}", action_id, msg);
+                                            let should_retry = tracker.mark_failed(&action_id, Some(msg.clone()));
+                                            if let Some(gid) = goal_id {
+                                                tracker.update_goal_progress(&gid, false, Some(msg));
+                                            }
+                                            if !should_retry {
+                                                warn!("Action {} exceeded max retries", action_id);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -264,6 +312,10 @@ impl HiveDaemon {
                 }
             }
         })
+    }
+
+    pub fn tracker(&self) -> &Arc<ActionTracker> {
+        &self.tracker
     }
 
     async fn wait_for_shutdown(&self) {
@@ -296,4 +348,16 @@ fn collect_node_metrics() -> NodeMetrics {
         memory_usage: 0.0,
         disk_usage: 0.0,
     }
+}
+
+fn extract_goal_id(action: &BrainAction) -> Option<String> {
+    match action {
+        BrainAction::UpdateGoalProgress { goal_id, .. } => Some(goal_id.clone()),
+        _ => None,
+    }
+}
+
+fn is_recently_failed(action: &BrainAction, recent_failures: &[crate::brain::TrackedAction]) -> bool {
+    use crate::brain::tracker::is_similar_action;
+    recent_failures.iter().any(|f| is_similar_action(&f.action, action))
 }

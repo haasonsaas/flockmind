@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use openraft::{ChangeMembers, Config, Raft};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 
@@ -20,10 +21,11 @@ pub struct RaftReplicator {
 }
 
 impl RaftReplicator {
-    pub async fn new(
+    pub async fn new<P: AsRef<Path>>(
         node_id: NodeIdType,
         addr: String,
         _hostname: String,
+        data_dir: P,
     ) -> Result<Self> {
         let config = Config {
             heartbeat_interval: 500,
@@ -34,14 +36,16 @@ impl RaftReplicator {
         let config = Arc::new(config.validate()?);
 
         let state = SharedState::new();
-        let (log_store, sm_store) = create_storage(state.clone());
+        let storage_path = data_dir.as_ref().join("raft");
+        std::fs::create_dir_all(&storage_path)?;
+        let (log_store, sm_store) = create_storage(&storage_path, state.clone())?;
         let network = HiveNetworkFactory::new();
 
         network.register_node(node_id, addr.clone());
 
         let raft = Raft::new(node_id, config, network.clone(), log_store, sm_store).await?;
 
-        info!("Raft node {} initialized at {}", node_id, addr);
+        info!("Raft node {} initialized at {} with storage at {:?}", node_id, addr, storage_path);
 
         Ok(Self {
             node_id,
